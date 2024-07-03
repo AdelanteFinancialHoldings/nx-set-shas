@@ -218,6 +218,7 @@ async function findSuccessfulCommit(
             status: run.status,
           }),
         );
+        process.stdout.write('\n');
       });
       return workflow_runs;
     })

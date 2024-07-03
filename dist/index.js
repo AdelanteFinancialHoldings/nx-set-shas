@@ -38015,6 +38015,7 @@ function findSuccessfulCommit(workflow_id, run_id, owner, repo, branch, lastSucc
                     event: run.event,
                     status: run.status,
                 }));
+                process.stdout.write('\n');
             });
             return workflow_runs;
         })
