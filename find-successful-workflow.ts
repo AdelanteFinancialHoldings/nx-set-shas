@@ -206,7 +206,10 @@ async function findSuccessfulCommit(
       `GET /repos/${owner}/${repo}/actions/workflows/${workflow_id}/runs`,
       workflowRunsFetchParams,
     )
-    .then(({ data: { workflow_runs } }) => {
+    .then((response) => {
+      const {
+        data: { workflow_runs },
+      } = response;
       process.stdout.write('\n');
       process.stdout.write(`workflow runs fetch result:\n`);
       workflow_runs.slice(0, 5).forEach((run) => {
@@ -220,7 +223,7 @@ async function findSuccessfulCommit(
         );
         process.stdout.write('\n');
       });
-      return workflow_runs;
+      return response;
     })
     .then(({ data: { workflow_runs } }) =>
       workflow_runs.map((run: { head_sha: any }) => run.head_sha),

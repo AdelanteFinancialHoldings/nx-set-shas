@@ -38005,7 +38005,8 @@ function findSuccessfulCommit(workflow_id, run_id, owner, repo, branch, lastSucc
         // fetch all workflow runs on a given repo/branch/workflow with push and success
         const shas = yield octokit
             .request(`GET /repos/${owner}/${repo}/actions/workflows/${workflow_id}/runs`, workflowRunsFetchParams)
-            .then(({ data: { workflow_runs } }) => {
+            .then((response) => {
+            const { data: { workflow_runs }, } = response;
             process.stdout.write('\n');
             process.stdout.write(`workflow runs fetch result:\n`);
             workflow_runs.slice(0, 5).forEach((run) => {
@@ -38017,7 +38018,7 @@ function findSuccessfulCommit(workflow_id, run_id, owner, repo, branch, lastSucc
                 }));
                 process.stdout.write('\n');
             });
-            return workflow_runs;
+            return response;
         })
             .then(({ data: { workflow_runs } }) => workflow_runs.map((run) => run.head_sha));
         return yield findExistingCommit(octokit, branch, shas);
