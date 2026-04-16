@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  NODE_VERSION: '20.9.0'
+
 jobs:
   test:
     name: Test
@@ -34,10 +37,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set Node.js 18.x
-        uses: actions/setup-node@v3
+      - name: Setup Node.js
+        # uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: 18
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install
         run: yarn --frozen-lockfile
