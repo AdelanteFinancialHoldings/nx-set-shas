@@ -51,6 +51,9 @@ jobs:
       - name: Compile
         run: yarn build
 
+      - name: Test successful workflow baseline selection
+        run: node --test tests/find-successful-workflow.test.cjs
+
       - name: Test default PR Workflow
         if: github.event_name == 'pull_request'
         uses: ./

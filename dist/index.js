@@ -38021,7 +38021,7 @@ function findSuccessfulCommit(workflow_id, run_id, owner, repo, branch, lastSucc
             return response;
         })
             .then(({ data: { workflow_runs } }) => workflow_runs.map((run) => run.head_sha));
-        return yield findExistingCommit(octokit, branch, shas);
+        return findExistingCommit(branch, shas);
     });
 }
 function findMergeBaseRef() {
@@ -38056,44 +38056,94 @@ function findMergeQueueBranch() {
 /**
  * Get first existing commit
  */
-function findExistingCommit(octokit, branchName, shas) {
-    return __awaiter(this, void 0, void 0, function* () {
-        for (const commitSha of shas) {
-            if (yield commitExists(octokit, branchName, commitSha)) {
-                return commitSha;
-            }
-        }
+function findExistingCommit(branchName, shas) {
+    if (shas.length === 0) {
         return undefined;
-    });
+    }
+    const targetSha = resolveTargetBranchSha(branchName);
+    for (const commitSha of shas) {
+        if (commitExists(branchName, targetSha, commitSha)) {
+            return commitSha;
+        }
+    }
+    return undefined;
 }
 /**
  * Check if given commit is valid
  */
-function commitExists(octokit, branchName, commitSha) {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            (0, child_process_1.spawnSync)('git', ['cat-file', '-e', commitSha], {
-                stdio: ['pipe', 'pipe', null],
-            });
-            // Check the commit exists in general
-            yield octokit.request('GET /repos/{owner}/{repo}/commits/{commit_sha}', {
-                owner,
-                repo,
-                commit_sha: commitSha,
-            });
-            // Check the commit exists on the expected main branch (it will not in the case of a rebased main branch)
-            const commits = yield octokit.request('GET /repos/{owner}/{repo}/commits', {
-                owner,
-                repo,
-                sha: branchName,
-                per_page: 100,
-            });
-            return commits.data.some((commit) => commit.sha === commitSha);
-        }
-        catch (_a) {
-            return false;
-        }
+function commitExists(branchName, targetSha, commitSha) {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commitSha)) {
+        throw new Error(`Successful workflow returned an invalid commit SHA: '${commitSha}'`);
+    }
+    const objectResult = (0, child_process_1.spawnSync)('git', ['cat-file', '--batch-check=%(objectname) %(objecttype)'], {
+        encoding: 'utf-8',
+        input: `${commitSha}\n`,
     });
+    assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);
+    const objectFields = String(objectResult.stdout).trim().split(/\s+/);
+    if (objectFields.length !== 2 ||
+        objectFields[0].toLowerCase() !== commitSha.toLowerCase()) {
+        throw new Error(`Git returned an invalid object check for candidate '${commitSha}'`);
+    }
+    if (objectFields[1] === 'missing') {
+        process.stdout.write(`WARNING: Successful workflow candidate '${commitSha}' is missing from local Git objects; skipping it.\n`);
+        return false;
+    }
+    if (objectFields[1] !== 'commit') {
+        throw new Error(`Successful workflow candidate '${commitSha}' is a ${objectFields[1]} object, not a commit`);
+    }
+    const ancestryResult = (0, child_process_1.spawnSync)('git', ['merge-base', '--is-ancestor', commitSha, targetSha], { encoding: 'utf-8' });
+    if (!ancestryResult.error &&
+        !ancestryResult.signal &&
+        ancestryResult.status === 0) {
+        return true;
+    }
+    if (!ancestryResult.error &&
+        !ancestryResult.signal &&
+        ancestryResult.status === 1) {
+        process.stdout.write(`WARNING: Successful workflow candidate '${commitSha}' is not an ancestor of origin/${branchName} (${targetSha}); skipping it.\n`);
+        return false;
+    }
+    throw gitValidationError(`validate whether '${commitSha}' is an ancestor of origin/${branchName}`, ancestryResult);
+}
+function resolveTargetBranchSha(branchName) {
+    const shallowResult = (0, child_process_1.spawnSync)('git', ['rev-parse', '--is-shallow-repository'], { encoding: 'utf-8' });
+    assertGitSucceeded('check whether the checkout is shallow', shallowResult);
+    const shallowStatus = String(shallowResult.stdout).trim();
+    if (shallowStatus === 'true') {
+        throw new Error(`Cannot validate successful workflow baselines: the Git checkout is shallow; fetch complete history and origin/${branchName}`);
+    }
+    if (shallowStatus !== 'false') {
+        throw new Error(`Git returned an invalid shallow-check result: '${shallowStatus}'`);
+    }
+    const targetRef = `refs/remotes/origin/${branchName}^{commit}`;
+    const targetResult = (0, child_process_1.spawnSync)('git', ['rev-parse', '--verify', targetRef], {
+        encoding: 'utf-8',
+    });
+    assertGitSucceeded(`resolve target branch origin/${branchName}`, targetResult);
+    const targetSha = String(targetResult.stdout).trim();
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+        throw new Error(`Git returned an invalid commit SHA for origin/${branchName}: '${targetSha}'`);
+    }
+    return targetSha;
+}
+function assertGitSucceeded(operation, result) {
+    if (result.error || result.signal || result.status !== 0) {
+        throw gitValidationError(operation, result);
+    }
+}
+function gitValidationError(operation, result) {
+    let detail = result.stderr ? String(result.stderr).trim() : '';
+    if (result.error) {
+        detail = result.error.message;
+    }
+    else if (result.signal) {
+        detail = `process terminated by ${result.signal}`;
+    }
+    else if (!detail) {
+        detail = `exit status ${result.status}`;
+    }
+    return new Error(`Git failed to ${operation}: ${detail}`);
 }
 /**
  * Strips LF line endings from given string
