@@ -240,6 +240,69 @@ for (const [
     assert.equal(result.outputs.head, fixture.headSha);
     assert.equal(result.failure, undefined);
   });
+
+  test(`${implementationName}: fails on a corrupt candidate object without falling back`, async () => {
+    const directory = createCorruptCandidateFixture();
+    try {
+      const result = await runAction({
+        getCode,
+        implementationKind,
+        candidates: [directory.corruptSha],
+        directory: directory.path,
+        fatal: false,
+      });
+
+      assert.match(result.failure ?? '', /Git failed to check candidate/);
+      assert.match(result.failure ?? '', /inflate|unable to unpack|corrupt/i);
+      assert.equal(result.outputs.base, undefined);
+      assert.equal(result.outputs.head, undefined);
+      assert.equal(result.outputs.noPreviousBuild, undefined);
+    } finally {
+      fs.rmSync(directory.path, { recursive: true, force: true });
+    }
+  });
+
+  test(`${implementationName}: fails when the fallback commit count fails`, async () => {
+    const result = await runAction({
+      getCode,
+      implementationKind,
+      candidates: [],
+      gitFailure: 'rev-list-count',
+      fatal: false,
+    });
+
+    assert.match(result.failure ?? '', /Git failed to count commits/);
+    assert.equal(result.outputs.base, undefined);
+    assert.equal(result.outputs.head, undefined);
+    assert.equal(result.outputs.noPreviousBuild, undefined);
+  });
+}
+
+function createCorruptCandidateFixture() {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'nx-set-shas-corrupt-'),
+  );
+  fs.cpSync(fixture.directory, directory, { recursive: true });
+  const tree = runGit(directory, ['rev-parse', `${fixture.headSha}^{tree}`]);
+  const corruptSha = runGit(directory, [
+    'commit-tree',
+    tree,
+    '-p',
+    fixture.headSha,
+    '-m',
+    'corrupt candidate',
+  ]);
+  const objectPath = path.join(
+    directory,
+    '.git',
+    'objects',
+    corruptSha.slice(0, 2),
+    corruptSha.slice(2),
+  );
+  fs.chmodSync(objectPath, 0o644);
+  fs.writeFileSync(objectPath, 'this is not a zlib stream');
+  fs.chmodSync(objectPath, 0o444);
+  return { path: directory, corruptSha };
 }
 
 function createGitFixture() {
@@ -357,6 +420,7 @@ async function runAction({
   shallow = false,
   gitFailure,
   fatal = true,
+  directory = fixture.directory,
 }) {
   const result = {
     outputs: {},
@@ -402,19 +466,6 @@ async function runAction({
               status: 'success',
             })),
           },
-        };
-      }
-      if (route === 'GET /repos/{owner}/{repo}/commits/{commit_sha}') {
-        return { data: { sha: params.commit_sha } };
-      }
-      if (route === 'GET /repos/{owner}/{repo}/commits') {
-        const shas = runGit(fixture.directory, [
-          'rev-list',
-          '--max-count=100',
-          targetSha,
-        ]);
-        return {
-          data: shas.split('\n').map((sha) => ({ sha })),
         };
       }
       throw new Error(`Unexpected GitHub request: ${route}`);
@@ -478,6 +529,13 @@ async function runAction({
             return gitResult(128, '', '');
           }
           if (
+            gitFailure === 'rev-list-count' &&
+            args[0] === 'rev-list' &&
+            args[1] === '--count'
+          ) {
+            return gitResult(128, '', 'fatal: injected rev-list failure');
+          }
+          if (
             gitFailure === 'malformed-object-response' &&
             args[0] === 'cat-file' &&
             args[1]?.startsWith('--batch-check')
@@ -504,7 +562,7 @@ async function runAction({
       'main',
       String(fatal),
       'workflow_dispatch',
-      fixture.directory,
+      directory,
       '123',
       '',
     ],

@@ -37870,6 +37870,7 @@ const workflowId = process.argv[7];
 const fallbackSHA = process.argv[8];
 const defaultWorkingDirectory = '.';
 const ProxifiedClient = action_1.Octokit.plugin(proxyPlugin);
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 let BASE_SHA;
 (() => __awaiter(void 0, void 0, void 0, function* () {
     if (workingDirectory !== defaultWorkingDirectory) {
@@ -37923,13 +37924,24 @@ let BASE_SHA;
                     process.stdout.write('\n');
                     process.stdout.write(`NOTE: You can instead make this a hard error by setting 'error-on-no-successful-workflow' on the action in your workflow.\n`);
                     process.stdout.write('\n');
-                    const commitCountOutput = (0, child_process_1.spawnSync)('git', ['rev-list', '--count', `origin/${mainBranchName}`], { encoding: 'utf-8' }).stdout;
-                    const commitCount = parseInt(stripNewLineEndings(commitCountOutput), 10);
-                    const LAST_COMMIT_CMD = `origin/${mainBranchName}${commitCount > 1 ? '~1' : ''}`;
-                    const baseRes = (0, child_process_1.spawnSync)('git', ['rev-parse', LAST_COMMIT_CMD], {
-                        encoding: 'utf-8',
-                    });
-                    BASE_SHA = baseRes.stdout;
+                    try {
+                        const commitCountResult = (0, child_process_1.spawnSync)('git', ['rev-list', '--count', `origin/${mainBranchName}`], { encoding: 'utf-8' });
+                        assertGitSucceeded(`count commits on origin/${mainBranchName}`, commitCountResult);
+                        const commitCount = parseInt(stripNewLineEndings(String(commitCountResult.stdout)), 10);
+                        if (Number.isNaN(commitCount)) {
+                            throw new Error(`Git returned an invalid commit count for origin/${mainBranchName}: '${String(commitCountResult.stdout).trim()}'`);
+                        }
+                        const LAST_COMMIT_CMD = `origin/${mainBranchName}${commitCount > 1 ? '~1' : ''}`;
+                        const baseRes = (0, child_process_1.spawnSync)('git', ['rev-parse', LAST_COMMIT_CMD], {
+                            encoding: 'utf-8',
+                        });
+                        assertGitSucceeded(`resolve ${LAST_COMMIT_CMD}`, baseRes);
+                        BASE_SHA = baseRes.stdout;
+                    }
+                    catch (e) {
+                        core.setFailed(e.message);
+                        return;
+                    }
                 }
                 core.setOutput('noPreviousBuild', 'true');
             }
@@ -38069,10 +38081,17 @@ function findExistingCommit(branchName, shas) {
     return undefined;
 }
 /**
- * Check if given commit is valid
+ * Check whether a candidate commit is usable as a baseline: it must be a
+ * well-formed SHA, present and readable in the local object database, a commit
+ * object, and an ancestor of the target branch tip.
+ *
+ * Returns false (skip) for a genuinely absent object or a non-ancestor commit.
+ * Throws on malformed SHAs, unreadable/corrupt objects, non-commit objects and
+ * any Git failure, so callers abort instead of silently falling back.
  */
 function commitExists(branchName, targetSha, commitSha) {
-    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commitSha)) {
+    var _a;
+    if (!COMMIT_SHA_PATTERN.test(commitSha)) {
         throw new Error(`Successful workflow returned an invalid commit SHA: '${commitSha}'`);
     }
     const objectResult = (0, child_process_1.spawnSync)('git', ['cat-file', '--batch-check=%(objectname) %(objecttype)'], {
@@ -38080,6 +38099,13 @@ function commitExists(branchName, targetSha, commitSha) {
         input: `${commitSha}\n`,
     });
     assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);
+    // `cat-file --batch-check` can exit 0 and print "<sha> missing" for a
+    // corrupt/unreadable object, reporting the real cause only on stderr. A
+    // genuinely absent object produces no stderr output.
+    const objectStderr = String((_a = objectResult.stderr) !== null && _a !== void 0 ? _a : '').trim();
+    if (objectStderr) {
+        throw new Error(`Git failed to check candidate commit '${commitSha}': ${objectStderr}`);
+    }
     const objectFields = String(objectResult.stdout).trim().split(/\s+/);
     if (objectFields.length !== 2 ||
         objectFields[0].toLowerCase() !== commitSha.toLowerCase()) {
@@ -38122,7 +38148,7 @@ function resolveTargetBranchSha(branchName) {
     });
     assertGitSucceeded(`resolve target branch origin/${branchName}`, targetResult);
     const targetSha = String(targetResult.stdout).trim();
-    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+    if (!COMMIT_SHA_PATTERN.test(targetSha)) {
         throw new Error(`Git returned an invalid commit SHA for origin/${branchName}: '${targetSha}'`);
     }
     return targetSha;

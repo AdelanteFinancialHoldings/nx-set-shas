@@ -22,6 +22,8 @@ const defaultWorkingDirectory = '.';
 
 const ProxifiedClient = Octokit.plugin(proxyPlugin);
 
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
 let BASE_SHA: string;
 (async () => {
   if (workingDirectory !== defaultWorkingDirectory) {
@@ -94,23 +96,40 @@ let BASE_SHA: string;
           );
           process.stdout.write('\n');
 
-          const commitCountOutput = spawnSync(
-            'git',
-            ['rev-list', '--count', `origin/${mainBranchName}`],
-            { encoding: 'utf-8' },
-          ).stdout;
-          const commitCount = parseInt(
-            stripNewLineEndings(commitCountOutput),
-            10,
-          );
+          try {
+            const commitCountResult = spawnSync(
+              'git',
+              ['rev-list', '--count', `origin/${mainBranchName}`],
+              { encoding: 'utf-8' },
+            );
+            assertGitSucceeded(
+              `count commits on origin/${mainBranchName}`,
+              commitCountResult,
+            );
+            const commitCount = parseInt(
+              stripNewLineEndings(String(commitCountResult.stdout)),
+              10,
+            );
+            if (Number.isNaN(commitCount)) {
+              throw new Error(
+                `Git returned an invalid commit count for origin/${mainBranchName}: '${String(
+                  commitCountResult.stdout,
+                ).trim()}'`,
+              );
+            }
 
-          const LAST_COMMIT_CMD = `origin/${mainBranchName}${
-            commitCount > 1 ? '~1' : ''
-          }`;
-          const baseRes = spawnSync('git', ['rev-parse', LAST_COMMIT_CMD], {
-            encoding: 'utf-8',
-          });
-          BASE_SHA = baseRes.stdout;
+            const LAST_COMMIT_CMD = `origin/${mainBranchName}${
+              commitCount > 1 ? '~1' : ''
+            }`;
+            const baseRes = spawnSync('git', ['rev-parse', LAST_COMMIT_CMD], {
+              encoding: 'utf-8',
+            });
+            assertGitSucceeded(`resolve ${LAST_COMMIT_CMD}`, baseRes);
+            BASE_SHA = baseRes.stdout;
+          } catch (e) {
+            core.setFailed(e.message);
+            return;
+          }
         }
         core.setOutput('noPreviousBuild', 'true');
       }
@@ -285,14 +304,20 @@ function findExistingCommit(
 }
 
 /**
- * Check if given commit is valid
+ * Check whether a candidate commit is usable as a baseline: it must be a
+ * well-formed SHA, present and readable in the local object database, a commit
+ * object, and an ancestor of the target branch tip.
+ *
+ * Returns false (skip) for a genuinely absent object or a non-ancestor commit.
+ * Throws on malformed SHAs, unreadable/corrupt objects, non-commit objects and
+ * any Git failure, so callers abort instead of silently falling back.
  */
 function commitExists(
   branchName: string,
   targetSha: string,
   commitSha: string,
 ): boolean {
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commitSha)) {
+  if (!COMMIT_SHA_PATTERN.test(commitSha)) {
     throw new Error(
       `Successful workflow returned an invalid commit SHA: '${commitSha}'`,
     );
@@ -307,6 +332,15 @@ function commitExists(
     },
   );
   assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);
+  // `cat-file --batch-check` can exit 0 and print "<sha> missing" for a
+  // corrupt/unreadable object, reporting the real cause only on stderr. A
+  // genuinely absent object produces no stderr output.
+  const objectStderr = String(objectResult.stderr ?? '').trim();
+  if (objectStderr) {
+    throw new Error(
+      `Git failed to check candidate commit '${commitSha}': ${objectStderr}`,
+    );
+  }
 
   const objectFields = String(objectResult.stdout).trim().split(/\s+/);
   if (
@@ -386,7 +420,7 @@ function resolveTargetBranchSha(branchName: string): string {
     targetResult,
   );
   const targetSha = String(targetResult.stdout).trim();
-  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(targetSha)) {
+  if (!COMMIT_SHA_PATTERN.test(targetSha)) {
     throw new Error(
       `Git returned an invalid commit SHA for origin/${branchName}: '${targetSha}'`,
     );

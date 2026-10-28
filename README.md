@@ -111,6 +111,10 @@ jobs:
 
 <!-- end configuration-options -->
 
+## Git history requirements
+
+When validating the last successful workflow run, the action requires the full Git history (`fetch-depth: 0` on `actions/checkout`) and the target remote branch ref (`origin/<main-branch-name>`) to be present locally. It fails explicitly, rather than falling back, on shallow checkouts or when that ref is missing. A candidate commit whose object is missing locally or that is not an ancestor of `origin/<main-branch-name>` is skipped; an unreadable or corrupt Git object also fails the action.
+
 ## Permissions in v2+
 
 This Action uses Github API to find the last successful workflow run. If your `GITHUB_TOKEN` has restrictions set please ensure you override them for the workflow to enable read access to `actions` and `contents`:
