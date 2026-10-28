@@ -285,6 +285,10 @@ function createCorruptCandidateFixture() {
   fs.cpSync(fixture.directory, directory, { recursive: true });
   const tree = runGit(directory, ['rev-parse', `${fixture.headSha}^{tree}`]);
   const corruptSha = runGit(directory, [
+    '-c',
+    'user.name=Fixture',
+    '-c',
+    'user.email=fixture@example.invalid',
     'commit-tree',
     tree,
     '-p',
