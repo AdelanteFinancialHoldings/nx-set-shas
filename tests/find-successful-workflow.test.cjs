@@ -70,6 +70,36 @@ for (const [
     assert.equal(result.failure, undefined);
   });
 
+  for (const [traceName, env] of [
+    ['GIT_TRACE', { GIT_TRACE: '1' }],
+    [
+      'multiple Git trace channels',
+      {
+        GIT_TRACE: '1',
+        GIT_TRACE_SETUP: '1',
+        GIT_TRACE_PERFORMANCE: '1',
+        GIT_TRACE_PACK_ACCESS: '1',
+        GIT_TRACE2: '1',
+        GIT_TRACE2_EVENT: '1',
+        GIT_TRACE2_PERF: '1',
+      },
+    ],
+  ]) {
+    test(`${implementationName}: accepts a valid ancestor with ${traceName}`, async () => {
+      const result = await runAction({
+        getCode,
+        implementationKind,
+        candidates: [fixture.baselineSha],
+        env,
+      });
+
+      assert.equal(result.failure, undefined);
+      assert.equal(result.outputs.base, fixture.baselineSha);
+      assert.equal(result.outputs.head, fixture.headSha);
+      assert.equal(result.outputs.noPreviousBuild, undefined);
+    });
+  }
+
   test(`${implementationName}: rejects a commit outside the target branch`, async () => {
     const result = await runAction({
       getCode,
@@ -115,6 +145,20 @@ for (const [
     assert.match(result.stdout, new RegExp(missingSha));
     assert.match(result.stdout, /missing from local Git objects/i);
     assert.equal(result.failure, undefined);
+  });
+
+  test(`${implementationName}: skips missing objects with Git tracing enabled`, async () => {
+    const result = await runAction({
+      getCode,
+      implementationKind,
+      candidates: ['0'.repeat(40), fixture.baselineSha],
+      env: { GIT_TRACE: '1' },
+    });
+
+    assert.equal(result.failure, undefined);
+    assert.equal(result.outputs.base, fixture.baselineSha);
+    assert.equal(result.outputs.head, fixture.headSha);
+    assert.match(result.stdout, /missing from local Git objects/i);
   });
 
   test(`${implementationName}: validates ancestry against origin branch, not HEAD`, async () => {
@@ -241,26 +285,31 @@ for (const [
     assert.equal(result.failure, undefined);
   });
 
-  test(`${implementationName}: fails on a corrupt candidate object without falling back`, async () => {
-    const directory = createCorruptCandidateFixture();
-    try {
-      const result = await runAction({
-        getCode,
-        implementationKind,
-        candidates: [directory.corruptSha],
-        directory: directory.path,
-        fatal: false,
-      });
+  for (const tracing of [false, true]) {
+    test(`${implementationName}: fails on a corrupt candidate object without falling back${
+      tracing ? ' with Git tracing enabled' : ''
+    }`, async () => {
+      const directory = createCorruptCandidateFixture();
+      try {
+        const result = await runAction({
+          getCode,
+          implementationKind,
+          candidates: [directory.corruptSha],
+          directory: directory.path,
+          fatal: false,
+          env: tracing ? { GIT_TRACE: '1' } : {},
+        });
 
-      assert.match(result.failure ?? '', /Git failed to check candidate/);
-      assert.match(result.failure ?? '', /inflate|unable to unpack|corrupt/i);
-      assert.equal(result.outputs.base, undefined);
-      assert.equal(result.outputs.head, undefined);
-      assert.equal(result.outputs.noPreviousBuild, undefined);
-    } finally {
-      fs.rmSync(directory.path, { recursive: true, force: true });
-    }
-  });
+        assert.match(result.failure ?? '', /Git failed to check candidate/);
+        assert.match(result.failure ?? '', /inflate|unable to unpack|corrupt/i);
+        assert.equal(result.outputs.base, undefined);
+        assert.equal(result.outputs.head, undefined);
+        assert.equal(result.outputs.noPreviousBuild, undefined);
+      } finally {
+        fs.rmSync(directory.path, { recursive: true, force: true });
+      }
+    });
+  }
 
   test(`${implementationName}: fails when the fallback commit count fails`, async () => {
     const result = await runAction({
@@ -425,6 +474,7 @@ async function runAction({
   gitFailure,
   fatal = true,
   directory = fixture.directory,
+  env = {},
 }) {
   const result = {
     outputs: {},
@@ -547,6 +597,7 @@ async function runAction({
             return gitResult(0, 'malformed response\n');
           }
           return childProcess.spawnSync(command, args, {
+            env: fakeProcess.env,
             ...options,
             cwd: workingDirectory,
           });
@@ -570,7 +621,7 @@ async function runAction({
       '123',
       '',
     ],
-    env: {},
+    env: { ...process.env, ...env },
     stdout: {
       write(text) {
         result.stdout += String(text);

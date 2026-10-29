@@ -323,12 +323,21 @@ function commitExists(
     );
   }
 
+  // Keep diagnostic traces out of this check's stderr so object-read errors
+  // remain fatal. Disable tracing only in this subprocess, not the action.
+  const objectEnv = { ...process.env };
+  for (const name of Object.keys(objectEnv)) {
+    if (name.startsWith('GIT_TRACE')) {
+      objectEnv[name] = '0';
+    }
+  }
   const objectResult = spawnSync(
     'git',
     ['cat-file', '--batch-check=%(objectname) %(objecttype)'],
     {
       encoding: 'utf-8',
       input: `${commitSha}\n`,
+      env: objectEnv,
     },
   );
   assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);

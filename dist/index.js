@@ -38094,9 +38094,18 @@ function commitExists(branchName, targetSha, commitSha) {
     if (!COMMIT_SHA_PATTERN.test(commitSha)) {
         throw new Error(`Successful workflow returned an invalid commit SHA: '${commitSha}'`);
     }
+    // Keep diagnostic traces out of this check's stderr so object-read errors
+    // remain fatal. Disable tracing only in this subprocess, not the action.
+    const objectEnv = Object.assign({}, process.env);
+    for (const name of Object.keys(objectEnv)) {
+        if (name.startsWith('GIT_TRACE')) {
+            objectEnv[name] = '0';
+        }
+    }
     const objectResult = (0, child_process_1.spawnSync)('git', ['cat-file', '--batch-check=%(objectname) %(objecttype)'], {
         encoding: 'utf-8',
         input: `${commitSha}\n`,
+        env: objectEnv,
     });
     assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);
     // `cat-file --batch-check` can exit 0 and print "<sha> missing" for a
