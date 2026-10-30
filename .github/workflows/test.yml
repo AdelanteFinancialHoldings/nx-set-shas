@@ -51,6 +51,9 @@ jobs:
       - name: Compile
         run: yarn build
 
+      - name: Test
+        run: yarn test
+
       - name: Test default PR Workflow
         if: github.event_name == 'pull_request'
         uses: ./

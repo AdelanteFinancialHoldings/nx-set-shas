@@ -22,6 +22,8 @@ const defaultWorkingDirectory = '.';
 
 const ProxifiedClient = Octokit.plugin(proxyPlugin);
 
+const COMMIT_SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
 let BASE_SHA: string;
 (async () => {
   if (workingDirectory !== defaultWorkingDirectory) {
@@ -94,23 +96,40 @@ let BASE_SHA: string;
           );
           process.stdout.write('\n');
 
-          const commitCountOutput = spawnSync(
-            'git',
-            ['rev-list', '--count', `origin/${mainBranchName}`],
-            { encoding: 'utf-8' },
-          ).stdout;
-          const commitCount = parseInt(
-            stripNewLineEndings(commitCountOutput),
-            10,
-          );
+          try {
+            const commitCountResult = spawnSync(
+              'git',
+              ['rev-list', '--count', `origin/${mainBranchName}`],
+              { encoding: 'utf-8' },
+            );
+            assertGitSucceeded(
+              `count commits on origin/${mainBranchName}`,
+              commitCountResult,
+            );
+            const commitCount = parseInt(
+              stripNewLineEndings(String(commitCountResult.stdout)),
+              10,
+            );
+            if (Number.isNaN(commitCount)) {
+              throw new Error(
+                `Git returned an invalid commit count for origin/${mainBranchName}: '${String(
+                  commitCountResult.stdout,
+                ).trim()}'`,
+              );
+            }
 
-          const LAST_COMMIT_CMD = `origin/${mainBranchName}${
-            commitCount > 1 ? '~1' : ''
-          }`;
-          const baseRes = spawnSync('git', ['rev-parse', LAST_COMMIT_CMD], {
-            encoding: 'utf-8',
-          });
-          BASE_SHA = baseRes.stdout;
+            const LAST_COMMIT_CMD = `origin/${mainBranchName}${
+              commitCount > 1 ? '~1' : ''
+            }`;
+            const baseRes = spawnSync('git', ['rev-parse', LAST_COMMIT_CMD], {
+              encoding: 'utf-8',
+            });
+            assertGitSucceeded(`resolve ${LAST_COMMIT_CMD}`, baseRes);
+            BASE_SHA = baseRes.stdout;
+          } catch (e) {
+            core.setFailed(e.message);
+            return;
+          }
         }
         core.setOutput('noPreviousBuild', 'true');
       }
@@ -229,7 +248,7 @@ async function findSuccessfulCommit(
       workflow_runs.map((run: { head_sha: any }) => run.head_sha),
     );
 
-  return await findExistingCommit(octokit, branch, shas);
+  return findExistingCommit(branch, shas);
 }
 
 async function findMergeBaseRef(): Promise<string> {
@@ -267,13 +286,17 @@ async function findMergeQueueBranch(): Promise<string> {
 /**
  * Get first existing commit
  */
-async function findExistingCommit(
-  octokit: Octokit,
+function findExistingCommit(
   branchName: string,
   shas: string[],
-): Promise<string | undefined> {
+): string | undefined {
+  if (shas.length === 0) {
+    return undefined;
+  }
+
+  const targetSha = resolveTargetBranchSha(branchName);
   for (const commitSha of shas) {
-    if (await commitExists(octokit, branchName, commitSha)) {
+    if (commitExists(branchName, targetSha, commitSha)) {
       return commitSha;
     }
   }
@@ -281,39 +304,161 @@ async function findExistingCommit(
 }
 
 /**
- * Check if given commit is valid
+ * Check whether a candidate commit is usable as a baseline: it must be a
+ * well-formed SHA, present and readable in the local object database, a commit
+ * object, and an ancestor of the target branch tip.
+ *
+ * Returns false (skip) for a genuinely absent object or a non-ancestor commit.
+ * Throws on malformed SHAs, unreadable/corrupt objects, non-commit objects and
+ * any Git failure, so callers abort instead of silently falling back.
  */
-async function commitExists(
-  octokit: Octokit,
+function commitExists(
   branchName: string,
+  targetSha: string,
   commitSha: string,
-): Promise<boolean> {
-  try {
-    spawnSync('git', ['cat-file', '-e', commitSha], {
-      stdio: ['pipe', 'pipe', null],
-    });
-
-    // Check the commit exists in general
-    await octokit.request('GET /repos/{owner}/{repo}/commits/{commit_sha}', {
-      owner,
-      repo,
-      commit_sha: commitSha,
-    });
-
-    // Check the commit exists on the expected main branch (it will not in the case of a rebased main branch)
-    const commits = await octokit.request('GET /repos/{owner}/{repo}/commits', {
-      owner,
-      repo,
-      sha: branchName,
-      per_page: 100,
-    });
-
-    return commits.data.some(
-      (commit: { sha: string }) => commit.sha === commitSha,
+): boolean {
+  if (!COMMIT_SHA_PATTERN.test(commitSha)) {
+    throw new Error(
+      `Successful workflow returned an invalid commit SHA: '${commitSha}'`,
     );
-  } catch {
+  }
+
+  // Keep diagnostic traces out of this check's stderr so object-read errors
+  // remain fatal. Disable tracing only in this subprocess, not the action.
+  const objectEnv = { ...process.env };
+  for (const name of Object.keys(objectEnv)) {
+    if (name.startsWith('GIT_TRACE')) {
+      objectEnv[name] = '0';
+    }
+  }
+  const objectResult = spawnSync(
+    'git',
+    ['cat-file', '--batch-check=%(objectname) %(objecttype)'],
+    {
+      encoding: 'utf-8',
+      input: `${commitSha}\n`,
+      env: objectEnv,
+    },
+  );
+  assertGitSucceeded(`check candidate commit '${commitSha}'`, objectResult);
+  // `cat-file --batch-check` can exit 0 and print "<sha> missing" for a
+  // corrupt/unreadable object, reporting the real cause only on stderr. A
+  // genuinely absent object produces no stderr output.
+  const objectStderr = String(objectResult.stderr ?? '').trim();
+  if (objectStderr) {
+    throw new Error(
+      `Git failed to check candidate commit '${commitSha}': ${objectStderr}`,
+    );
+  }
+
+  const objectFields = String(objectResult.stdout).trim().split(/\s+/);
+  if (
+    objectFields.length !== 2 ||
+    objectFields[0].toLowerCase() !== commitSha.toLowerCase()
+  ) {
+    throw new Error(
+      `Git returned an invalid object check for candidate '${commitSha}'`,
+    );
+  }
+  if (objectFields[1] === 'missing') {
+    process.stdout.write(
+      `WARNING: Successful workflow candidate '${commitSha}' is missing from local Git objects; skipping it.\n`,
+    );
     return false;
   }
+  if (objectFields[1] !== 'commit') {
+    throw new Error(
+      `Successful workflow candidate '${commitSha}' is a ${objectFields[1]} object, not a commit`,
+    );
+  }
+
+  const ancestryResult = spawnSync(
+    'git',
+    ['merge-base', '--is-ancestor', commitSha, targetSha],
+    { encoding: 'utf-8' },
+  );
+  if (
+    !ancestryResult.error &&
+    !ancestryResult.signal &&
+    ancestryResult.status === 0
+  ) {
+    return true;
+  }
+  if (
+    !ancestryResult.error &&
+    !ancestryResult.signal &&
+    ancestryResult.status === 1
+  ) {
+    process.stdout.write(
+      `WARNING: Successful workflow candidate '${commitSha}' is not an ancestor of origin/${branchName} (${targetSha}); skipping it.\n`,
+    );
+    return false;
+  }
+
+  throw gitValidationError(
+    `validate whether '${commitSha}' is an ancestor of origin/${branchName}`,
+    ancestryResult,
+  );
+}
+
+function resolveTargetBranchSha(branchName: string): string {
+  const shallowResult = spawnSync(
+    'git',
+    ['rev-parse', '--is-shallow-repository'],
+    { encoding: 'utf-8' },
+  );
+  assertGitSucceeded('check whether the checkout is shallow', shallowResult);
+  const shallowStatus = String(shallowResult.stdout).trim();
+  if (shallowStatus === 'true') {
+    throw new Error(
+      `Cannot validate successful workflow baselines: the Git checkout is shallow; fetch complete history and origin/${branchName}`,
+    );
+  }
+  if (shallowStatus !== 'false') {
+    throw new Error(
+      `Git returned an invalid shallow-check result: '${shallowStatus}'`,
+    );
+  }
+
+  const targetRef = `refs/remotes/origin/${branchName}^{commit}`;
+  const targetResult = spawnSync('git', ['rev-parse', '--verify', targetRef], {
+    encoding: 'utf-8',
+  });
+  assertGitSucceeded(
+    `resolve target branch origin/${branchName}`,
+    targetResult,
+  );
+  const targetSha = String(targetResult.stdout).trim();
+  if (!COMMIT_SHA_PATTERN.test(targetSha)) {
+    throw new Error(
+      `Git returned an invalid commit SHA for origin/${branchName}: '${targetSha}'`,
+    );
+  }
+  return targetSha;
+}
+
+function assertGitSucceeded(
+  operation: string,
+  result: ReturnType<typeof spawnSync>,
+): void {
+  if (result.error || result.signal || result.status !== 0) {
+    throw gitValidationError(operation, result);
+  }
+}
+
+function gitValidationError(
+  operation: string,
+  result: ReturnType<typeof spawnSync>,
+): Error {
+  let detail = result.stderr ? String(result.stderr).trim() : '';
+  if (result.error) {
+    detail = result.error.message;
+  } else if (result.signal) {
+    detail = `process terminated by ${result.signal}`;
+  } else if (!detail) {
+    detail = `exit status ${result.status}`;
+  }
+  return new Error(`Git failed to ${operation}: ${detail}`);
 }
 
 /**
